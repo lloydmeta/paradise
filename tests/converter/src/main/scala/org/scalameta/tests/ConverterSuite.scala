@@ -1,34 +1,45 @@
 package org.scalameta.tests
 
+import java.io.{File, PrintWriter}
 import scala.collection.immutable.Seq
 import scala.{meta => m}
+import scala.reflect.io._
 import scala.tools.cmd.CommandLineParser
 import scala.tools.nsc.{Global, CompilerCommand, Settings}
 import scala.tools.nsc.reporters.StoreReporter
 import org.scalatest._
 import org.scalameta.paradise.converters.Converter
+import org.scalameta.paradise.mirrors.Mirrors
 
-trait ConverterSuite extends FunSuiteLike {
+class ConverterSuite(projectName: String) extends FunSuiteLike {
 
   // If true, parses code as a compilation unit.
   val parseAsCompilationUnit = false
 
-  private lazy val g: Global = {
+  lazy val g: Global = {
     def fail(msg: String) = sys.error(s"ReflectToMeta initialization failed: $msg")
-    val classpath         = System.getProperty("sbt.paths.testsConverter.test.classes")
+    val classpath         = System.getProperty(s"sbt.paths.$projectName.test.classes")
     val pluginpath        = System.getProperty("sbt.paths.plugin.jar")
     val options           = "-cp " + classpath + " -Xplugin:" + pluginpath + ":" + classpath + " -Xplugin-require:macroparadise"
     val args              = CommandLineParser.tokenize(options)
     val emptySettings     = new Settings(error => fail(s"couldn't apply settings because $error"))
-    val reporter          = new StoreReporter()
-    val command           = new CompilerCommand(args, emptySettings)
-    val settings          = command.settings
-    val g                 = new Global(settings, reporter)
-    val run               = new g.Run
+    emptySettings.Yrangepos.value = true
+    val reporter = new StoreReporter()
+    val command  = new CompilerCommand(args, emptySettings)
+    val settings = command.settings
+    val g        = new Global(settings, reporter)
+    val run      = new g.Run
     g.phase = run.parserPhase
     g.globalPhase = run.parserPhase
     g
   }
+
+  private object converter extends Converter {
+    lazy val global: ConverterSuite.this.g.type = ConverterSuite.this.g
+    def apply(gtree: g.Tree): m.Tree            = gtree.toMtree[m.Tree]
+  }
+
+  lazy val mirror: m.Mirror = Mirrors(g).mirror
 
   case class MismatchException(details: String) extends Exception
   private def checkMismatchesModuloDesugarings(parsed: m.Tree, converted: m.Tree): Unit = {
@@ -115,33 +126,68 @@ trait ConverterSuite extends FunSuiteLike {
     loop(parsed, converted)
   }
 
-  private def getParsedScalacTree(code: String): g.Tree = {
-    import g._
+  private def createRunFromSnippet(code: String): (g.Run, g.CompilationUnit) = {
+    // NOTE: `parseStatsOrPackages` fails to parse abstract type defs without bounds,
+    // so we need to apply a workaround to ensure that we correctly process those.
+    val rxAbstractTypeNobounds = """^type (\w+)(\[[^=]*?\])?$""".r
+    val needsParseWorkaround   = rxAbstractTypeNobounds.unapplySeq(code).isDefined
+    val code1                  = if (!needsParseWorkaround) code else code + " <: Dummy"
+
+    val jfile  = File.createTempFile("paradise", ".scala")
+    val writer = new PrintWriter(jfile)
+    try writer.write(code1)
+    finally writer.close()
+
+    val run          = new g.Run
+    val abstractFile = AbstractFile.getFile(jfile)
+    val sourceFile   = g.getSourceFile(abstractFile)
+    val unit         = new g.CompilationUnit(sourceFile)
+    run.compileUnits(List(unit), run.phaseNamed("terminal"))
+
+    g.phase = run.parserPhase
+    g.globalPhase = run.parserPhase
     val reporter = new StoreReporter()
     g.reporter = reporter
-    val tree = {
+    unit.body = {
       if (parseAsCompilationUnit) {
-        val cu     = new g.CompilationUnit(g.newSourceFile(code))
-        val parser = new g.syntaxAnalyzer.UnitParser(cu, Nil)
-        parser.parse()
+        g.newUnitParser(unit).parse()
       } else {
-        // NOTE: `parseStatsOrPackages` fails to parse abstract type defs without bounds,
-        // so we need to apply a workaround to ensure that we correctly process those.
-        def somewhatBrokenParse(code: String) =
-          gen.mkTreeOrBlock(newUnitParser(code, "<toolbox>").parseStatsOrPackages())
-        val rxAbstractTypeNobounds = """^type (\w+)(\[[^=]*?\])?$""".r
-        code match {
-          case rxAbstractTypeNobounds(_ *) =>
-            val tdef @ TypeDef(mods, name, tparams, _) = somewhatBrokenParse(code + " <: Dummy")
-            treeCopy.TypeDef(tdef, mods, name, tparams, TypeBoundsTree(EmptyTree, EmptyTree))
-          case _ =>
-            somewhatBrokenParse(code)
+        val tree = g.gen.mkTreeOrBlock(g.newUnitParser(unit).parseStatsOrPackages())
+        if (!needsParseWorkaround) tree
+        else {
+          val tdef @ g.TypeDef(mods, name, tparams, _) = tree
+          g.treeCopy.TypeDef(tdef, mods, name, tparams, g.TypeBoundsTree(g.EmptyTree, g.EmptyTree))
         }
       }
     }
-    val errors = reporter.infos.filter(_.severity == g.reporter.ERROR)
+    val errors = reporter.infos.filter(_.severity == reporter.ERROR)
     errors.foreach(error => fail(s"scalac parse error: ${error.msg} at ${error.pos}"))
-    tree
+
+    (run, unit)
+  }
+
+  private def getParsedScalacTree(code: String): g.Tree = {
+    val (run, unit) = createRunFromSnippet(code)
+    unit.body
+  }
+
+  private def getTypedScalacTree(code: String): g.Tree = {
+    import g._
+    val (run, unit) = createRunFromSnippet(code)
+
+    val phases   = List(run.parserPhase, run.namerPhase, run.typerPhase)
+    val reporter = new StoreReporter()
+    g.reporter = reporter
+
+    phases.foreach(phase => {
+      g.phase = phase
+      g.globalPhase = phase
+      phase.asInstanceOf[GlobalPhase].apply(unit)
+      val errors = reporter.infos.filter(_.severity == reporter.ERROR)
+      errors.foreach(error => fail(s"scalac ${phase.name} error: ${error.msg} at ${error.pos}"))
+    })
+
+    unit.body
   }
 
   private def getParsedMetaTree(code: String): m.Tree = {
@@ -153,17 +199,17 @@ trait ConverterSuite extends FunSuiteLike {
     }
   }
 
-  def getConvertedMetaTree(code: String): m.Tree = {
-    object converter extends Converter {
-      lazy val global: ConverterSuite.this.g.type = ConverterSuite.this.g
-      def apply(gtree: g.Tree): m.Tree            = gtree.toMtree[m.Tree]
-    }
+  def getUnattributedConvertedMetaTree(code: String): m.Tree = {
     converter(getParsedScalacTree(code))
   }
 
-  def syntactic(code: String): Unit = {
+  def getAttributedConvertedMetaTree(code: String): m.Tree = {
+    converter(getTypedScalacTree(code))
+  }
+
+  private def test(code: String, converter: String => m.Tree): Unit = {
     test(code.trim) {
-      val convertedMetaTree = getConvertedMetaTree(code)
+      val convertedMetaTree = converter(code)
       val parsedMetaTree    = getParsedMetaTree(code)
       try {
         checkMismatchesModuloDesugarings(parsedMetaTree, convertedMetaTree)
@@ -178,6 +224,55 @@ trait ConverterSuite extends FunSuiteLike {
                |${convertedMetaTree.structure}""".stripMargin
           fail(s"$header\n$fullDetails")
       }
+    }
+  }
+
+  // TODO: Merge syntactic and semantic into one method in the future.
+  // Our current goal is to achieve perfect conversion,
+  // i.e. to have the result of syntactic conversion
+  // structurally equal to the result of semantic conversion.
+
+  def syntactic(code: String): Unit = {
+    test(code, getUnattributedConvertedMetaTree _)
+  }
+
+  // TODO: Allow stats as inputs to `semantic`.
+  // If we can't parse code as a compilation unit,
+  // we should be able to just wrap it in a dummy class and convert that.
+
+  case class Context(gtree: g.Tree, mtree: m.Tree, mirror: m.Mirror) {
+    private def unique(p: PartialFunction[m.Tree, Boolean]): m.Tree = {
+      val trees = mtree.collect { case tree: m.Tree if p.isDefinedAt(tree) && p(tree) => tree }
+      trees match {
+        case Nil           => sys.error("search failed")
+        case result :: Nil => result
+        case _             => sys.error("search ambiguous")
+      }
+    }
+
+    def tpe(name: String): String = {
+      val result = unique { case m: m.Member => m.name.syntax == name }
+      mirror.tpe(result.asInstanceOf[m.Member]).get.syntax
+    }
+
+    def desugar(code: String): String = {
+      val result = unique { case tree => tree.syntax == code }
+      mirror.desugar(result).get.syntax
+    }
+  }
+
+  def semantic(code: String)(body: Context => Unit): Unit = {
+    test(code) {
+      val gtree = getTypedScalacTree(code)
+      val mtree = {
+        // TODO: also use getAttributedConvertedMetaTree?
+        import scala.meta._
+        val jfile = g.currentRun.units.next.source.file.file
+        if (parseAsCompilationUnit) jfile.parse[m.Source].get
+        else jfile.parse[m.Stat].get
+      }
+      val mirror = this.mirror
+      body(Context(gtree, mtree, mirror))
     }
   }
 }

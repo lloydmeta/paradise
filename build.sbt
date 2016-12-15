@@ -1,6 +1,6 @@
 lazy val ScalaVersions  = Seq("2.11.8")
-lazy val MetaVersion    = "1.4.0"
-lazy val LibraryVersion = "3.0.0-SNAPSHOT"
+lazy val MetaVersion    = "2.0.0.564"
+lazy val LibraryVersion = "4.0.0-SNAPSHOT"
 lazy val isSnapshot     = LibraryVersion.endsWith("SNAPSHOT")
 lazy val PRVersion      = latestPullRequestVersion()
 
@@ -121,7 +121,8 @@ lazy val root = project
     plugin,
     testsAnnotationsMeta,
     testsAnnotationsReflect,
-    testsConverter
+    testsConverter,
+    testsMirror
   )
 
 // main scala.meta paradise plugin
@@ -236,10 +237,19 @@ lazy val testsConverter = project
   .settings(
     sharedSettings,
     testSettings,
-    libraryDependencies += "com.lihaoyi" %% "geny" % "0.1.0" % "test", // to lazy load 26k files
+    libraryDependencies += "com.lihaoyi" %% "geny" % "0.1.0", // to lazy load 26k files
     exposePaths("testsConverter", Test)
   )
   .dependsOn(testsCommon, plugin)
+
+lazy val testsMirror = project
+  .in(file("tests/mirror"))
+  .settings(
+    sharedSettings,
+    testSettings,
+    exposePaths("testsMirror", Test)
+  )
+  .dependsOn(testsConverter, plugin)
 
 def parsePullRequestFromCommitMessage: Option[String] = {
   import sys.process._
