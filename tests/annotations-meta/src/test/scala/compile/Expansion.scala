@@ -3,6 +3,18 @@ import org.scalatest.FunSuite
 // TODO: DavidDudson: simplify with argument macros
 class Expansion extends FunSuite {
 
+  test("for-comprehensions should work with identity") {
+    @identity
+    object Foo {
+      def nums = Seq(1, 2, 3)
+      def incrNums =
+        for {
+          n <- nums
+          _ = n + 2
+        } yield n + 1
+    }
+  }
+
   test("Nested macro should expand with identity") {
     @identity
     object Foo {
