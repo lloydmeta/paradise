@@ -120,13 +120,6 @@ class LogicalTrees[G <: Global](val global: G, root: G#Tree) extends ReflectTool
   object UndoDesugaring {
     def unapply(tree: g.Tree): Option[g.Tree] = {
       tree match {
-        // before: function((x$1, x$2) => x$1 + x$2)
-        // after:  function(_ + _)
-        case g.Function(vparams, body)
-            if vparams.forall(x =>
-              x.mods.hasFlag(SYNTHETIC) &&
-                x.name.startsWith(nme.FRESH_TERM_NAME_PREFIX)) =>
-          Some(body)
         case t: g.ValDef =>
           Some(l.undoValDefDesugarings(List(t)).head)
         case _ =>
@@ -169,7 +162,6 @@ class LogicalTrees[G <: Global](val global: G, root: G#Tree) extends ReflectTool
 
   object TermIdent {
     def unapply(tree: g.Ident): Option[l.TermName] = {
-      if (tree.name.startsWith(nme.FRESH_TERM_NAME_PREFIX)) return None
       val g.Ident(name) = tree
       if (name.isTypeName || tree.name == nme.WILDCARD) return None
       Some(l.TermName(tree.displayName).setType(tree.tpe))
@@ -449,8 +441,7 @@ class LogicalTrees[G <: Global](val global: G, root: G#Tree) extends ReflectTool
       val ltpt                         = if (tpt.nonEmpty) Some(tpt) else None
       val ldefault                     = if (default.nonEmpty) Some(default) else None
       val lname =
-        if (tree.name.startsWith(nme.FRESH_TERM_NAME_PREFIX) ||
-            tree.name == nme.WILDCARD) l.AnonymousName()
+        if (tree.name == nme.WILDCARD) l.AnonymousName()
         else l.TermName(tree)
       TermParamDef(l.Modifiers(tree), lname, ltpt, ldefault)
     }
